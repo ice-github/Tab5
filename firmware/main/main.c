@@ -85,7 +85,7 @@ static int usj_read_line(char *buf, size_t cap)
 static void usj_write_str(const char *s)
 {
     usb_serial_jtag_write_bytes(s, strlen(s), 1000);
-    usb_serial_jtag_wait_transmit_done(1000);
+    usb_serial_jtag_wait_tx_done(1000);
 }
 
 /* ---------------- TRANSFER mode ---------------- */
@@ -107,8 +107,8 @@ static int run_transfer(void)
         if (usj_read_line(line, sizeof(line)) < 0)
             return -1;
         char name[32];
-        uint32_t size, want;
-        if (sscanf(line, "FILE %31s %u %u", name, &size, &want) != 3)
+        unsigned int size, want;
+        if (sscanf(line, "FILE %31s %u %x", name, &size, &want) != 3)
             return -1;
         if (strcmp(name, kFiles[i])) {
             usj_write_str("ERR\n");
@@ -158,12 +158,12 @@ static int run_transfer(void)
         }
         fclose(f);
         if (v != want) {
-            ESP_LOGE(TAG, "%s crc mismatch got %08X want %08X", name, v, want);
+            ESP_LOGE(TAG, "%s crc mismatch got %08X want %08X", name, (unsigned)v, want);
             usj_write_str("ERR\n");
             return -1;
         }
         char ok[48];
-        snprintf(ok, sizeof(ok), "OK %08X\n", v);
+        snprintf(ok, sizeof(ok), "OK %08X\n", (unsigned)v);
         usj_write_str(ok);
         ESP_LOGI(TAG, "%s %u bytes crc %08X", name, size, v);
     }
