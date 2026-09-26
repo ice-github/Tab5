@@ -1,0 +1,37 @@
+# Build
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+
+# ESP-IDF tools (installed outside repo)
+# ~/esp/esp-idf-v5.5.4, ~/.espressif
+
+# Media work (large, regenerable; do not commit)
+media/
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.pcm
+*.raw
+frames/
+frames*.jpg
+frame_*.jpg
+
+# Flash backups (large, device-specific)
+backups/
+*.bin
+
+# Beads local state: keep config + export, ignore embedded DB internals if large
+# (adjust after `bd init` if needed)
+.beads/*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
