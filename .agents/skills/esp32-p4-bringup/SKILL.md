@@ -118,7 +118,24 @@ observing the failure before editing.
   names the transfer path before adjusting.
 - Gate: multi-MB transfer completes with no `task_wdt` lines in the log.
 
-## 8. Host sender discipline
+## 8. Player performance: measure stages, fix the real bottleneck
+
+- Instrument the frame loop with per-stage averages (SD read / JPEG
+  decode / draw) reported every N frames. On this project: read 24ms,
+  decode 9ms, draw ~0ms — yet fps stayed 23.5 after killing the read.
+- Lesson: the video clock matters more than stage times. `target` derives
+  from an audio-sample counter updated only when the blocking audio write
+  returns; 8KB chunks updated it every ~43ms and quantized video to
+  23fps regardless of decode speed.
+- Fixes that worked, in order:
+  1. Preload the whole MJPEG (~7MB) into PSRAM at startup; per-frame SD
+     `pread` (~24ms) becomes `memcpy` (~0ms).
+  2. Shrink audio chunks to 1920B (480 frames = 10.0ms @48kHz) so the
+     audio clock updates faster than the 33ms frame budget.
+- Result: 30.0fps, skip=0, decode 9ms/frame. Gate: `skip=0` sustained,
+  not just average fps.
+
+## 9. Host sender discipline
 
 - Log every device line (`[dev] ...`) but match protocol lines by prefix;
   boot logs share the same wire as the protocol.
