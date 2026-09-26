@@ -360,7 +360,7 @@ void app_main(void)
     esp_codec_dev_sample_info_t fs = {
         .sample_rate = A_RATE, .channel = A_CH, .bits_per_sample = 16};
     ESP_ERROR_CHECK(esp_codec_dev_open(spk, &fs));
-    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(spk, 70));
+    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(spk, 0)); /* muted for now */
     xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 12, NULL, 1);
 
     /* video loop driven by audio clock */
