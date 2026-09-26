@@ -1,0 +1,23 @@
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SIZE_32MB=y
+
+# Console over USB-Serial-JTAG (fixed function on USB-C)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 4MB app, rest for FATFS-less raw use is on SD; keep simple factory layout
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# SDMMC 4-bit, high speed
+CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL=n
+
+# LCD: 2 frame buffers for tear-free flip
+CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
+
+# No LVGL for the performance path (raw panel access)
+CONFIG_BSP_CONFIG_NO_GRAPHIC_LIB=y
+
+# JPEG timeout comfortably above one 720p decode (~10ms)
+CONFIG_JPEG_ENABLE_DEBUG_LOG=n

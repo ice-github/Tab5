@@ -1,0 +1,5 @@
+dependencies:
+  espressif/m5stack_tab5: "^1.0.0"
+  # esp_lvgl_port 2.9+ needs IDF with DPI on_frame_buf_complete (IDF>=6);
+  # pin to a 2.5.x that builds on IDF v5.5.4
+  espressif/esp_lvgl_port: "~2.5.0"
