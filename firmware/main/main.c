@@ -8,17 +8,20 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "esp_cache.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/jpeg_decode.h"
 #include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_codec_dev.h"
@@ -45,36 +48,37 @@ static void crc_init(void)
         crc32_tab[i] = c;
     }
 }
-/* ---------- console line helpers (stdin/stdout, unbuffered) ---------- */
-/* NOTE: the USB-Serial-JTAG VFS read returns immediately (possibly 0 bytes)
- * when no data is available, so poll with a deadline instead of blocking. */
+/* ---------- console line helpers (TX via VFS stdout, RX via driver) ---------- */
+/* RX uses the driver API directly with explicit timeouts. Rationale: VFS
+ * fread() semantics flip with driver state — without the driver it
+ * returns 0 immediately, with the driver it blocks forever — so neither
+ * gives the poll-with-deadline behavior this protocol needs. */
 static int usj_read_exact(uint8_t *buf, size_t n, int timeout_ms)
 {
     size_t got = 0;
-    int64_t dl = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    int64_t dl = esp_timer_get_time() + (int64_t)timeout_ms * 1000; /* us */
     while (got < n) {
-        got += fread(buf + got, 1, n - got, stdin);
-        if (got < n) {
-            if (esp_timer_get_time() > dl)
-                return -1;
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
+        if (esp_timer_get_time() > dl)
+            return -1;
+        int r = usb_serial_jtag_read_bytes(buf + got, n - got,
+                                           pdMS_TO_TICKS(20));
+        if (r > 0)
+            got += (size_t)r;
     }
     return 0;
 }
 static int usj_read_line(char *buf, size_t cap)
 {
     size_t n = 0;
-    int64_t dl = esp_timer_get_time() + (int64_t)120 * 1000;
+    int64_t dl = esp_timer_get_time() + (int64_t)120 * 1000 * 1000; /* 120 s */
     while (n + 1 < cap) {
+        if (esp_timer_get_time() > dl)
+            return -1;
         char c;
-        size_t r = fread(&c, 1, 1, stdin);
-        if (r == 0) {
-            if (esp_timer_get_time() > dl)
-                return -1;
-            vTaskDelay(pdMS_TO_TICKS(5));
+        int r = usb_serial_jtag_read_bytes((uint8_t *)&c, 1,
+                                           pdMS_TO_TICKS(5));
+        if (r <= 0)
             continue;
-        }
         if (c == '\n')
             break;
         if (c != '\r')
@@ -95,12 +99,28 @@ static const char *kFiles[] = {"meta.json", "frames.mjpeg", "frames.idx", "audio
 static int run_transfer(void)
 {
     char line[128];
+    /* Bulk SD writes + polled reads can exceed the task watchdog window;
+     * this phase is not real-time, so drop the watchdog here. */
+    esp_task_wdt_deinit();
     ESP_LOGI(TAG, "transfer mode: waiting for host");
+    /* Drain stale RX bytes left over from previous boots or old-protocol
+     * senders; otherwise they corrupt the first FILE header / payload. */
+    {
+        int64_t dend = esp_timer_get_time() + (int64_t)300 * 1000;
+        uint8_t db;
+        while (esp_timer_get_time() < dend) {
+            if (usb_serial_jtag_read_bytes(&db, 1, pdMS_TO_TICKS(10)) > 0)
+                dend = esp_timer_get_time() + (int64_t)100 * 1000;
+        }
+    }
     usj_write_str("TAB5_XFER_READY\n");
     mkdir(VID_DIR, 0777);
     for (int i = 0; i < 4; i++) {
-        if (usj_read_line(line, sizeof(line)) < 0)
-            return -1;
+        /* skip blank lines (stale newlines, terminal noise) */
+        do {
+            if (usj_read_line(line, sizeof(line)) < 0)
+                return -1;
+        } while (line[0] == 0);
         char name[32];
         unsigned int size, want;
         if (sscanf(line, "FILE %31s %u %x", name, &size, &want) != 3)
@@ -112,34 +132,49 @@ static int run_transfer(void)
         usj_write_str("GO\n");
         char path[64];
         snprintf(path, sizeof(path), VID_DIR "/%s", name);
+        {
+            struct stat dst;
+            int ms = mkdir(VID_DIR, 0777);
+            int se = stat(VID_DIR, &dst);
+            ESP_LOGI(TAG, "mkdir=%d stat=%d mode=%o", ms, se,
+                     se == 0 ? (unsigned)dst.st_mode : 0);
+        }
         FILE *f = fopen(path, "wb");
         if (!f) {
+            ESP_LOGE(TAG, "fopen %s failed errno=%d", path, errno);
             usj_write_str("ERR\n");
             return -1;
         }
-        uint32_t crc = 0xFFFFFFFFu ^ 0xFFFFFFFFu; /* start 0 */
-        crc = 0;
         uint32_t left = size;
         static uint8_t buf[4096];
-        uint32_t c = 0;
+        /* Chunked transfer with per-chunk handshake: the small USB RX
+         * ringbuffer can overflow during slow SD writes, so the host
+         * sends NEXT, waits for SEND, then streams one chunk. */
         while (left) {
-            size_t ch = left > sizeof(buf) ? sizeof(buf) : left;
-            if (usj_read_exact(buf, ch, 10000) < 0) {
+            do {
+                if (usj_read_line(line, sizeof(line)) < 0) {
+                    fclose(f);
+                    return -1;
+                }
+            } while (line[0] == 0);
+            if (strcmp(line, "NEXT")) {
                 fclose(f);
                 return -1;
             }
-            /* incremental crc32 */
-            c ^= 0xFFFFFFFFu;
-            for (size_t k = 0; k < ch; k++)
-                c = crc32_tab[(c ^ buf[k]) & 0xFF] ^ (c >> 8);
-            c ^= 0xFFFFFFFFu;
+            size_t ch = left > sizeof(buf) ? sizeof(buf) : left;
+            usj_write_str("SEND\n");
+            if (usj_read_exact(buf, ch, 30000) < 0) {
+                fclose(f);
+                return -1;
+            }
             if (fwrite(buf, 1, ch, f) != ch) {
                 fclose(f);
                 return -1;
             }
             left -= ch;
+            usj_write_str("ACK\n");
+            vTaskDelay(1);
         }
-        (void)crc;
         fclose(f);
         /* verify by re-reading */
         f = fopen(path, "rb");
@@ -186,7 +221,9 @@ static size_t audio_len, audio_pos;
 
 static void audio_task(void *arg)
 {
-    const size_t CHUNK = 8192;
+    /* Small chunks so audio_samples (the video clock) updates every ~10ms.
+     * An 8KB chunk blocks ~43ms per write and quantizes video to 23fps. */
+    const size_t CHUNK = 1920; /* 480 stereo frames = 10.0ms @48kHz */
     while (1) {
         if (audio_pos >= audio_len) {
             audio_pos = 0; /* loop */
@@ -218,9 +255,27 @@ void app_main(void)
     if (!have_bundle) {
         /* Transfer mode over the console (stdin/stdout, unbuffered).
          * Boot logs may precede the READY marker; host ignores all lines
-         * until it sees it. */
+         * until it sees it.
+         * Critical: disable VFS line-ending translation (it corrupts
+         * binary payloads deterministically) and install the driver with
+         * a large RX buffer (default path is a tiny HW FIFO that drops
+         * bytes during slow SD writes). */
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stdin, NULL, _IONBF, 0);
+        usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_LF);
+        usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_LF);
+        {
+            usb_serial_jtag_driver_config_t usj_cfg = {
+                .rx_buffer_size = 16384,
+                .tx_buffer_size = 4096,
+            };
+            ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj_cfg));
+            /* Route VFS stdin/stdout through the driver ringbuffer.
+             * Without this, the installed driver's ISR drains the HW
+             * FIFO while fread() polls the empty FIFO: reads always
+             * return 0, GO is never sent, and the 120s deadline reboots. */
+            usb_serial_jtag_vfs_use_driver();
+        }
         if (run_transfer() == 0) {
             esp_restart();
         }
@@ -239,8 +294,22 @@ void app_main(void)
     assert(ents);
     assert(fread(ents, sizeof(*ents), nframes, ix) == nframes);
     fclose(ix);
-    int mjpg = open(VID_DIR "/frames.mjpeg", O_RDONLY);
-    assert(mjpg >= 0);
+    /* Whole MJPEG in PSRAM: per-frame SD pread costs ~24ms (the bottleneck);
+     * 7.2MB fits easily in 32MB PSRAM alongside the 1.9MB audio. */
+    uint8_t *mjpg_buf;
+    size_t mjpg_len;
+    {
+        FILE *mf = fopen(VID_DIR "/frames.mjpeg", "rb");
+        assert(mf);
+        fseek(mf, 0, SEEK_END);
+        mjpg_len = ftell(mf);
+        fseek(mf, 0, SEEK_SET);
+        mjpg_buf = heap_caps_malloc(mjpg_len, MALLOC_CAP_SPIRAM);
+        assert(mjpg_buf);
+        assert(fread(mjpg_buf, 1, mjpg_len, mf) == mjpg_len);
+        fclose(mf);
+        ESP_LOGI(TAG, "mjpeg %u bytes in PSRAM", (unsigned)mjpg_len);
+    }
 
     FILE *af = fopen(VID_DIR "/audio.pcm", "rb");
     assert(af);
@@ -255,7 +324,12 @@ void app_main(void)
     /* display, no LVGL */
     esp_lcd_panel_handle_t panel;
     esp_lcd_panel_io_handle_t io;
-    bsp_display_config_t dc = {0};
+    bsp_display_config_t dc = {
+        .dsi_bus = {
+            .phy_clk_src = 0, /* let the driver choose the default */
+            .lane_bit_rate_mbps = BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS,
+        }
+    };
     ESP_ERROR_CHECK(bsp_display_new(&dc, &panel, &io));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
     ESP_ERROR_CHECK(bsp_display_backlight_on());
@@ -274,7 +348,10 @@ void app_main(void)
     };
     /* PSRAM staging for compressed input (max frame observed ~64KB, margin x4) */
     size_t in_sz = 0;
-    uint8_t *in_buf = jpeg_alloc_decoder_mem(256 * 1024, NULL, &in_sz);
+    jpeg_decode_memory_alloc_cfg_t in_cfg = {
+        .buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER,
+    };
+    uint8_t *in_buf = jpeg_alloc_decoder_mem(256 * 1024, &in_cfg, &in_sz);
     assert(in_buf);
 
     /* audio path */
@@ -291,8 +368,17 @@ void app_main(void)
     void *fbs[2] = {fb0, fb1};
     int64_t t0 = esp_timer_get_time();
     uint32_t frames_shown = 0, frames_skip = 0;
+    uint64_t rd_us = 0, dec_us = 0, dr_us = 0;
     int cur = 0;
+    /* (Re)subscribe the main task: startup does not guarantee subscription,
+     * and transfer mode deinitializes the watchdog. */
+    {
+        esp_err_t wr = esp_task_wdt_add(NULL);
+        if (wr != ESP_OK && wr != ESP_ERR_INVALID_STATE)
+            ESP_ERROR_CHECK(wr);
+    }
     while (1) {
+        esp_task_wdt_reset();
         uint32_t target = (audio_samples * FPS) / A_RATE;
         if (target >= nframes) {
             /* loop handled by audio wrap; wait for it */
@@ -309,8 +395,11 @@ void app_main(void)
             frames_skip += (target - shown - 1);
         /* read + decode into inactive fb */
         cur ^= 1;
-        uint32_t got = pread(mjpg, in_buf, ents[target].len, ents[target].off);
-        assert(got == ents[target].len);
+        int64_t r0 = esp_timer_get_time();
+        assert(ents[target].off + ents[target].len <= mjpg_len);
+        memcpy(in_buf, mjpg_buf + ents[target].off, ents[target].len);
+        uint32_t got = ents[target].len;
+        int64_t r1 = esp_timer_get_time();
         uint32_t out_sz = 0;
         esp_err_t r = jpeg_decoder_process(dec, &jpg_cfg, in_buf, got,
                                            fbs[cur], FB_W * FB_H * 2, &out_sz);
@@ -318,15 +407,23 @@ void app_main(void)
             ESP_LOGE(TAG, "jpg dec fail f%u", (unsigned)target);
             continue;
         }
+        int64_t r2 = esp_timer_get_time();
         esp_cache_msync(fbs[cur], FB_W * FB_H * 2,
                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
         ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, FB_W, FB_H, fbs[cur]));
+        int64_t r3 = esp_timer_get_time();
+        rd_us += (uint64_t)(r1 - r0);
+        dec_us += (uint64_t)(r2 - r1);
+        dr_us += (uint64_t)(r3 - r2);
         shown = target;
         frames_shown++;
         if ((frames_shown & 63) == 0) {
             float el = (esp_timer_get_time() - t0) / 1e6f;
-            ESP_LOGI(TAG, "shown=%u skip=%u t=%.1fs fps=%.1f", (unsigned)frames_shown,
-                     (unsigned)frames_skip, el, frames_shown / el);
+            ESP_LOGI(TAG, "shown=%u skip=%u t=%.1fs fps=%.1f rd=%ums dec=%ums dr=%ums",
+                     (unsigned)frames_shown, (unsigned)frames_skip, el,
+                     frames_shown / el, (unsigned)(rd_us / 1000 / frames_shown),
+                     (unsigned)(dec_us / 1000 / frames_shown),
+                     (unsigned)(dr_us / 1000 / frames_shown));
         }
     }
 }

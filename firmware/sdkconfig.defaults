@@ -13,6 +13,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # SDMMC 4-bit, high speed
 CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL=n
 
+# Long filenames needed (meta.json, frames.mjpeg); LFN buffer on heap
+CONFIG_FATFS_LFN_HEAP=y
+
 # LCD: 2 frame buffers for tear-free flip
 CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
 
