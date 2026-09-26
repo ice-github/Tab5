@@ -1,6 +1,6 @@
 ---
 name: esp32-p4-bringup
-description: Use when bringing up ESP32-P4 firmware (e.g. M5Stack Tab5), hitting bootloader/chip-revision mismatch, USB-Serial-JTAG console transfer failures, SD/FatFS fopen errors, boot panics or reboot loops, or watchdog resets during bulk I/O. Trigger when flashing fails, the device reboots in a loop, or host-device serial transfer stalls or corrupts data.
+description: Use when bringing up ESP32-P4 firmware (e.g. M5Stack Tab5), hitting bootloader/chip-revision mismatch, USB-Serial-JTAG console transfer failures, SD/FatFS fopen errors, boot panics or reboot loops, watchdog resets during bulk I/O, or MIPI-DSI display init aborts. Trigger when flashing fails, the device reboots in a loop, the display stays dark after transfer, or host-device serial transfer stalls or corrupts data.
 ---
 
 # ESP32-P4 Bring-up and USB-Serial-JTAG Transfer
@@ -142,6 +142,14 @@ observing the failure before editing.
 - `expect()` helper: wait for a line with a wanted prefix, log the rest,
   and abort on too many consecutive empty reads (peer likely dead) rather
   than hanging forever.
+- READY is single-shot per boot: if the host connects mid-cycle it waits
+  until the next rx-deadline reboot (~120s here) before seeing READY.
+  For iteration, re-print READY as a heartbeat every few seconds until
+  the first FILE header arrives; on the host, keep listening instead of
+  assuming the device is dead after one missed READY.
+- Before debugging "weird" behavior, clean-rebuild (`rm -rf build`) and
+  reflash: ninja reuse can leave a stale `app_desc` timestamp that looks
+  like the new firmware but is not.
 - Print progress per N chunks (chunks done, MB, KB/s) so "process alive"
   and "transfer advancing" are distinguishable. A live process with no
   chunk progress is stuck, not slow.
@@ -149,3 +157,14 @@ observing the failure before editing.
   before reporting success.
 - Gate: sender output shows monotonic chunk progress; final `OK <CRC>`
   per file plus `COMPLETE`.
+
+## 10. Tab5 display init (MIPI-DSI, ILI9881C)
+
+- `bsp_display_new()` with a zeroed `bsp_display_config_t` aborts: DSI
+  `lane_bit_rate_mbps` 0 is invalid. Pass the board macro explicitly
+  (`firmware/main/main.c:327-333`):
+  `lane_bit_rate_mbps = BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS` (1000 = 1Gbps),
+  `phy_clk_src = 0` (driver default).
+- Symptom that points here: transfer COMPLETE and CRC-OK, then a reboot
+  every few seconds in player mode right after display init.
+- Gate: player reaches backlight-on with no abort after transfer.
