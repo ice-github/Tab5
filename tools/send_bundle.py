@@ -27,10 +27,15 @@ def main():
 
     ser = serial.Serial(PORT, 115200, timeout=15)
     time.sleep(0.5)
-    ser.reset_input_buffer()
-    ser.write(b"TAB5XFER\n")
-    print("wait READY...", flush=True)
-    assert readline(ser) == "READY", "no READY from device"
+    print("wait TAB5_XFER_READY...", flush=True)
+    for _ in range(600):
+        line = readline(ser, timeout=5)
+        if line == "TAB5_XFER_READY":
+            break
+        if line:
+            print(f"[dev] {line}", flush=True)
+    else:
+        raise SystemExit("no TAB5_XFER_READY from device")
 
     for name in FILES:
         data = blobs[name]

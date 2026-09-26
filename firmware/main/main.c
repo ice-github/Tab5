@@ -45,35 +45,36 @@ static void crc_init(void)
         crc32_tab[i] = c;
     }
 }
-static uint32_t crc_upd(uint32_t c, const uint8_t *d, size_t n)
-{
-    c ^= 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++)
-        c = crc32_tab[(c ^ d[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-
-/* ---------- USB-serial line helpers (raw, logs off in xfer mode) ---------- */
+/* ---------- console line helpers (stdin/stdout, unbuffered) ---------- */
+/* NOTE: the USB-Serial-JTAG VFS read returns immediately (possibly 0 bytes)
+ * when no data is available, so poll with a deadline instead of blocking. */
 static int usj_read_exact(uint8_t *buf, size_t n, int timeout_ms)
 {
     size_t got = 0;
     int64_t dl = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     while (got < n) {
-        int r = usb_serial_jtag_read_bytes(buf + got, n - got, 20);
-        if (r > 0)
-            got += r;
-        if (esp_timer_get_time() > dl)
-            return -1;
+        got += fread(buf + got, 1, n - got, stdin);
+        if (got < n) {
+            if (esp_timer_get_time() > dl)
+                return -1;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
     }
     return 0;
 }
 static int usj_read_line(char *buf, size_t cap)
 {
     size_t n = 0;
+    int64_t dl = esp_timer_get_time() + (int64_t)120 * 1000;
     while (n + 1 < cap) {
         char c;
-        if (usj_read_exact((uint8_t *)&c, 1, 5000) < 0)
-            return -1;
+        size_t r = fread(&c, 1, 1, stdin);
+        if (r == 0) {
+            if (esp_timer_get_time() > dl)
+                return -1;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
         if (c == '\n')
             break;
         if (c != '\r')
@@ -84,8 +85,8 @@ static int usj_read_line(char *buf, size_t cap)
 }
 static void usj_write_str(const char *s)
 {
-    usb_serial_jtag_write_bytes(s, strlen(s), 1000);
-    usb_serial_jtag_wait_tx_done(1000);
+    fputs(s, stdout);
+    fflush(stdout);
 }
 
 /* ---------------- TRANSFER mode ---------------- */
@@ -94,14 +95,8 @@ static const char *kFiles[] = {"meta.json", "frames.mjpeg", "frames.idx", "audio
 static int run_transfer(void)
 {
     char line[128];
-    ESP_LOGI(TAG, "waiting for host (TAB5XFER) ...");
-    while (1) {
-        if (usj_read_line(line, sizeof(line)) < 0)
-            continue;
-        if (!strcmp(line, "TAB5XFER"))
-            break;
-    }
-    usj_write_str("READY\n");
+    ESP_LOGI(TAG, "transfer mode: waiting for host");
+    usj_write_str("TAB5_XFER_READY\n");
     mkdir(VID_DIR, 0777);
     for (int i = 0; i < 4; i++) {
         if (usj_read_line(line, sizeof(line)) < 0)
@@ -125,7 +120,7 @@ static int run_transfer(void)
         uint32_t crc = 0xFFFFFFFFu ^ 0xFFFFFFFFu; /* start 0 */
         crc = 0;
         uint32_t left = size;
-        uint8_t buf[4096];
+        static uint8_t buf[4096];
         uint32_t c = 0;
         while (left) {
             size_t ch = left > sizeof(buf) ? sizeof(buf) : left;
@@ -165,7 +160,7 @@ static int run_transfer(void)
         char ok[48];
         snprintf(ok, sizeof(ok), "OK %08X\n", (unsigned)v);
         usj_write_str(ok);
-        ESP_LOGI(TAG, "%s %u bytes crc %08X", name, size, v);
+        ESP_LOGI(TAG, "%s %u bytes crc %08X", name, size, (unsigned)v);
     }
     if (usj_read_line(line, sizeof(line)) < 0 || strcmp(line, "DONE"))
         return -1;
@@ -209,19 +204,28 @@ static void audio_task(void *arg)
 void app_main(void)
 {
     crc_init();
-    ESP_ERROR_CHECK(bsp_sdcard_mount());
+    ESP_LOGI(TAG, "tab5player build %s %s", __DATE__, __TIME__);
+    esp_err_t sdr = bsp_sdcard_mount();
+    if (sdr != ESP_OK) {
+        ESP_LOGE(TAG, "sd mount failed: %s (retrying)", esp_err_to_name(sdr));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    }
     ESP_ERROR_CHECK(bsp_display_brightness_init());
 
     struct stat st;
     bool have_bundle = (stat(FLAG_FILE, &st) == 0);
     if (!have_bundle) {
-        /* quiet console so the byte stream stays clean */
-        esp_log_level_set("*", ESP_LOG_NONE);
-        usb_serial_jtag_driver_install(NULL);
+        /* Transfer mode over the console (stdin/stdout, unbuffered).
+         * Boot logs may precede the READY marker; host ignores all lines
+         * until it sees it. */
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stdin, NULL, _IONBF, 0);
         if (run_transfer() == 0) {
             esp_restart();
         }
         /* on error just retry after reboot */
+        vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     }
 
@@ -311,7 +315,7 @@ void app_main(void)
         esp_err_t r = jpeg_decoder_process(dec, &jpg_cfg, in_buf, got,
                                            fbs[cur], FB_W * FB_H * 2, &out_sz);
         if (r != ESP_OK) {
-            ESP_LOGE(TAG, "jpg dec fail f%u", target);
+            ESP_LOGE(TAG, "jpg dec fail f%u", (unsigned)target);
             continue;
         }
         esp_cache_msync(fbs[cur], FB_W * FB_H * 2,
@@ -321,8 +325,8 @@ void app_main(void)
         frames_shown++;
         if ((frames_shown & 63) == 0) {
             float el = (esp_timer_get_time() - t0) / 1e6f;
-            ESP_LOGI(TAG, "shown=%u skip=%u t=%.1fs fps=%.1f", frames_shown,
-                     frames_skip, el, frames_shown / el);
+            ESP_LOGI(TAG, "shown=%u skip=%u t=%.1fs fps=%.1f", (unsigned)frames_shown,
+                     (unsigned)frames_skip, el, frames_shown / el);
         }
     }
 }

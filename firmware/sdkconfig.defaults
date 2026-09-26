@@ -21,3 +21,6 @@ CONFIG_BSP_CONFIG_NO_GRAPHIC_LIB=y
 
 # JPEG timeout comfortably above one 720p decode (~10ms)
 CONFIG_JPEG_ENABLE_DEBUG_LOG=n
+
+# app_main uses multi-KB transfer buffers
+CONFIG_MAIN_TASK_STACK_SIZE=16384
