@@ -8,7 +8,7 @@ import serial
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
 FILES = ["meta.json", "frames.mjpeg", "frames.idx", "audio.pcm"]
-BUNDLE = "media/bundle"
+BUNDLE = sys.argv[2] if len(sys.argv) > 2 else "media/bundle"
 
 
 def readline(ser, timeout=15):

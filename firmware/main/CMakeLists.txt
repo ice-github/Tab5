@@ -1,3 +1,4 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES esp_driver_jpeg esp_lcd fatfs nvs_flash)
+                    REQUIRES esp_driver_jpeg esp_lcd fatfs nvs_flash
+                    PRIV_REQUIRES espressif__esp_lcd_touch)
