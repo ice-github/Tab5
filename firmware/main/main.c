@@ -228,8 +228,29 @@ typedef struct {
 
 static esp_codec_dev_handle_t spk;
 static volatile uint32_t audio_samples; /* stereo frames written */
-static uint8_t *audio_buf;
-static size_t audio_len, audio_pos;
+/* ---- audio streaming (3min+: 34.5MB PCM never fits PSRAM) ----
+ * Two 512KB PSRAM ping-pong buffers (~2.7s each). The feeder task fills
+ * the idle buffer from SD while audio_task consumes the playing one.
+ * Absolute position (au_total) drives loop wrap; audio_samples stays the
+ * video clock. Pause freezes both sides; vol=0 consumes silently. */
+#define AU_BUF_BYTES  (1024 * 1024)
+#define AU_BUF_N      2
+#define AU_SUB_BYTES  (256 * 1024) /* feeder SD unit: short bus holds */
+static uint8_t *au_buf[AU_BUF_N];
+static size_t au_fill[AU_BUF_N];     /* valid bytes (au_mutex) */
+static size_t au_file_off[AU_BUF_N]; /* file offset of buf start (au_mutex) */
+static int au_state[AU_BUF_N];       /* 0 empty, 1 filling, 2 ready (au_mutex) */
+static size_t au_next_off;           /* next file offset to fetch (au_mutex) */
+static int au_play;                  /* buffer under consumption (au_mutex) */
+static size_t au_play_off;           /* consumed bytes in au_play (consumer) */
+static size_t au_total;              /* absolute consumed bytes (consumer) */
+static size_t audio_len;             /* total PCM bytes (from stat) */
+static SemaphoreHandle_t au_mutex;
+static FIL au_mf; /* BSS: feeder task only, stack too small for FIL */
+static volatile uint32_t au_feed_us;  /* last feeder bulk read, us */
+static volatile uint32_t au_feed_max; /* max feeder bulk read, us (cumulative) */
+static volatile uint32_t au_stalls;   /* consumer buffer-wait hits (cumulative) */
+static volatile uint32_t au_stall_ms; /* consumer buffer-wait time, ms (cumul) */
 
 /* ---------------- touch pause / OSD ----------------
  * No LVGL in this pipeline: the OSD is drawn with direct RGB565
@@ -665,16 +686,54 @@ static void audio_task(void *arg)
     const size_t CHUNK = 1920; /* 480 stereo frames = 10.0ms @48kHz */
     while (1) {
         if (s_paused || !s_codec_open) {
-            /* frozen: audio_pos/audio_samples untouched, video clock holds.
+            /* frozen: au_total/audio_samples untouched, video clock holds.
              * !s_codec_open covers the suspend window (close+amp off). */
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        if (audio_pos >= audio_len) {
-            audio_pos = 0; /* loop */
+        if (au_total >= audio_len) {
+            /* loop: drop both buffers, feeder restarts from file head */
+            xSemaphoreTake(au_mutex, portMAX_DELAY);
+            au_total = 0;
             audio_samples = 0;
+            au_play = 0;
+            au_play_off = 0;
+            au_next_off = 0;
+            for (int i = 0; i < AU_BUF_N; i++) {
+                au_state[i] = 0;
+                au_fill[i] = 0;
+            }
+            xSemaphoreGive(au_mutex);
+            continue; /* feeder primes buf0 in ~50ms; video wrap path waits */
         }
-        size_t n = audio_len - audio_pos;
+        /* snapshot playing buffer under mutex; the feeder never touches
+         * the playing buffer's valid region, so no lock during write. */
+        int p;
+        size_t off, fill;
+        xSemaphoreTake(au_mutex, portMAX_DELAY);
+        p = au_play;
+        off = au_play_off;
+        fill = (au_state[p] == 2) ? au_fill[p] : 0;
+        if (off >= fill && fill > 0) {
+            /* playing buffer exhausted: release it, switch sides */
+            au_state[p] = 0;
+            au_fill[p] = 0;
+            au_play ^= 1;
+            au_play_off = 0;
+        }
+        xSemaphoreGive(au_mutex);
+        if (off >= fill) {
+            /* next buffer not ready yet: brief stall, video clock holds.
+             * NOTE: raw tick 1 (10ms @100Hz). pdMS_TO_TICKS(5) rounds to
+             * ZERO ticks = yield-only, which starves IDLE and trips the
+             * task watchdog (same trap as the SD prefetch path). */
+            int64_t s0 = esp_timer_get_time();
+            vTaskDelay(1);
+            au_stall_ms += (uint32_t)((esp_timer_get_time() - s0) / 1000);
+            au_stalls++;
+            continue;
+        }
+        size_t n = fill - off;
         if (n > CHUNK)
             n = CHUNK;
         if (s_vol == 0) {
@@ -686,15 +745,113 @@ static void audio_task(void *arg)
              * suspend when paused). */
             vTaskDelay(pdMS_TO_TICKS(10));
             a_write_us = 0;
-            audio_pos += n;
+            au_play_off += n;
+            au_total += n;
             audio_samples += (uint32_t)(n / (A_CH * 2));
             continue;
         }
         int64_t a0 = esp_timer_get_time();
-        esp_codec_dev_write(spk, audio_buf + audio_pos, n);
+        esp_codec_dev_write(spk, au_buf[p] + off, n);
         a_write_us = (uint32_t)(esp_timer_get_time() - a0);
-        audio_pos += n;
+        au_play_off += n;
+        au_total += n;
         audio_samples += (uint32_t)(n / (A_CH * 2));
+    }
+}
+
+/* Feeds the idle ping-pong buffer from SD. One 512KB bulk read (~50ms at
+ * measured ~10MB/s) covers ~2.7s of audio: negligible contention with the
+ * video prefetch path. Own FIL handle; FatFs reentrancy covers the shared
+ * volume (prefetch already reads concurrently). */
+static void audio_feed_task(void *arg)
+{
+    FIL *mf = &au_mf;
+    if (f_open(mf, "0:/video/audio.pcm", FA_READ) != FR_OK) {
+        ESP_LOGE(TAG, "audio feed: f_open audio.pcm failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    long file_pos = -1;
+    ESP_LOGI(TAG, "audio feed start len=%u", (unsigned)audio_len);
+    while (1) {
+        if (s_paused) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        int idx = -1;
+        size_t want_off = 0, want_len = 0;
+        xSemaphoreTake(au_mutex, portMAX_DELAY);
+        for (int i = 0; i < AU_BUF_N; i++) {
+            /* Any empty buffer qualifies, including the playing one while
+             * still untouched (startup prime). A buffer under consumption
+             * always has fill>0 or play_off>0, so it is never taken. */
+            if (au_state[i] != 0 || au_next_off >= audio_len)
+                continue;
+            if (i == au_play && (au_play_off != 0 || au_fill[i] != 0))
+                continue;
+            idx = i;
+            want_off = au_next_off;
+            want_len = audio_len - au_next_off;
+            if (want_len > AU_BUF_BYTES)
+                want_len = AU_BUF_BYTES;
+            au_state[i] = 1; /* filling */
+            au_file_off[i] = want_off;
+            au_next_off += want_len;
+            break;
+        }
+        xSemaphoreGive(au_mutex);
+        if (idx < 0) {
+            vTaskDelay(pdMS_TO_TICKS(50)); /* both buffers busy/full */
+            continue;
+        }
+        bool ok = true;
+        UINT br = 0;
+        size_t got = 0;
+        int64_t f0 = esp_timer_get_time();
+        /* Sub-chunk reads: a single 1MB bulk call holds the shared SD bus
+         * for its whole (sometimes seconds-long) duration and starves the
+         * video prefetch ring. 256KB units interleave with video traffic. */
+        while (got < want_len) {
+            size_t sub = want_len - got;
+            if (sub > AU_SUB_BYTES)
+                sub = AU_SUB_BYTES;
+            if (file_pos < 0 || (size_t)file_pos != want_off + got) {
+                if (f_lseek(mf, want_off + got) != FR_OK) {
+                    ESP_LOGW(TAG, "audio feed f_lseek %u failed",
+                             (unsigned)(want_off + got));
+                    ok = false;
+                    file_pos = -1;
+                    break;
+                }
+            }
+            if (f_read(mf, au_buf[idx] + got, sub, &br) != FR_OK ||
+                br != sub) {
+                ESP_LOGW(TAG, "audio feed read failed off=%u",
+                         (unsigned)(want_off + got));
+                ok = false;
+                file_pos = -1;
+                break;
+            }
+            file_pos = (long)(want_off + got + sub);
+            got += sub;
+        }
+        xSemaphoreTake(au_mutex, portMAX_DELAY);
+        if (ok) {
+            au_fill[idx] = want_len;
+            au_state[idx] = 2; /* ready */
+        } else if (got > 0) {
+            /* partial fill is still consumable; feeder resumes after it */
+            au_fill[idx] = got;
+            au_state[idx] = 2;
+            au_next_off = want_off + got;
+        } else {
+            au_state[idx] = 0; /* retry later */
+            au_next_off = want_off;
+        }
+        xSemaphoreGive(au_mutex);
+        au_feed_us = (uint32_t)(esp_timer_get_time() - f0);
+        if (au_feed_us > au_feed_max)
+            au_feed_max = au_feed_us;
     }
 }
 
@@ -720,7 +877,7 @@ static void audio_task(void *arg)
  *    preserved by construction (the miss surfaces in skip too).
  * A 10s bundle plays through the same path (fewer frames, same code).
  */
-#define PF_SLOT_BYTES   (256 * 1024)
+#define PF_SLOT_BYTES   (512 * 1024)
 #define PF_SLOTS_MIN    3
 #define PF_SLOTS_MAX    16
 #define PF_WAIT_MS      100
@@ -1128,15 +1285,39 @@ void app_main(void)
                  (unsigned)nframes, (unsigned)pf_mjpg_len);
     }
 
-    FILE *af = fopen(VID_DIR "/audio.pcm", "rb");
-    assert(af);
-    fseek(af, 0, SEEK_END);
-    audio_len = ftell(af);
-    fseek(af, 0, SEEK_SET);
-    audio_buf = heap_caps_malloc(audio_len, MALLOC_CAP_SPIRAM);
-    assert(audio_buf);
-    assert(fread(audio_buf, 1, audio_len, af) == audio_len);
-    fclose(af);
+    /* Audio length only: PCM streams from SD through the ping-pong
+     * window (a 3min file is 34.5MB, far beyond PSRAM). Must be a whole
+     * number of stereo s16 frames. */
+    {
+        struct stat ast;
+        assert(stat(VID_DIR "/audio.pcm", &ast) == 0);
+        audio_len = (size_t)ast.st_size;
+        assert(audio_len > 0 && audio_len % (A_CH * 2) == 0);
+        for (int i = 0; i < AU_BUF_N; i++) {
+            /* DMA-capable PSRAM, same as the video prefetch slots: a
+             * plain heap buffer forces the SDMMC 512B bounce path, where
+             * a 512KB bulk read sporadically takes seconds and starves
+             * the video prefetch ring (skip/underrun waves). */
+            esp_dma_mem_info_t di;
+            sdmmc_host_get_dma_info(0, &di);
+            di.extra_heap_caps |= MALLOC_CAP_SPIRAM;
+            size_t actual = 0;
+            assert(esp_dma_capable_malloc(AU_BUF_BYTES, &di,
+                                          (void **)&au_buf[i],
+                                          &actual) == ESP_OK &&
+                   au_buf[i] != NULL);
+            au_state[i] = 0;
+            au_fill[i] = 0;
+        }
+        au_mutex = xSemaphoreCreateMutex();
+        assert(au_mutex);
+        au_play = 0;
+        au_play_off = 0;
+        au_total = 0;
+        au_next_off = 0;
+        ESP_LOGI(TAG, "audio stream: %u bytes, %d x %u window",
+                 (unsigned)audio_len, AU_BUF_N, (unsigned)AU_BUF_BYTES);
+    }
 
     /* display, no LVGL */
     esp_lcd_panel_handle_t panel;
@@ -1173,10 +1354,10 @@ void app_main(void)
     uint8_t *in_buf = jpeg_alloc_decoder_mem(256 * 1024, &in_cfg, &in_sz);
     assert(in_buf);
 
-    /* PSRAM budget, measured not assumed: audio (1.9MB for 10s, ~5.8MB
-     * for 30s) is already allocated above, display FBs by the driver.
-     * Remaining free must cover the 1.8MB pause backup + decoder input
-     * + prefetch ring, with 1MB slack for driver/GDMA use. */
+    /* PSRAM budget, measured not assumed: audio streams from SD through
+     * the 2x512KB window (already allocated above), display FBs by the
+     * driver. Remaining free must cover the 1.8MB pause backup + decoder
+     * input + prefetch ring, with 1MB slack for driver/GDMA use. */
     {
         size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         size_t need_fixed = OSD_FB_SZ + in_sz;
@@ -1237,6 +1418,31 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(spk, 0)); /* muted for now */
     /* audio task starts after pre-roll (below), so the A/V clock never
      * outruns the prefetch ring at startup. */
+    /* (Re)subscribe the main task early: the audio prime wait below and
+     * the pre-roll further down both feed the WDT, and transfer mode
+     * deinitializes the watchdog. Startup does not guarantee
+     * subscription. */
+    {
+        esp_err_t wr = esp_task_wdt_add(NULL);
+        if (wr != ESP_OK && wr != ESP_ERR_INVALID_STATE)
+            ESP_ERROR_CHECK(wr);
+    }
+    /* Audio feeder owns its own FILE handle; prime buf0 before the clock. */
+    xTaskCreatePinnedToCore(audio_feed_task, "aufeed", 12288, NULL, 4, NULL,
+                            0);
+    {
+        int64_t adl = esp_timer_get_time() + (int64_t)15 * 1000 * 1000;
+        while (esp_timer_get_time() < adl) {
+            esp_task_wdt_reset();
+            xSemaphoreTake(au_mutex, portMAX_DELAY);
+            int ready = (au_state[0] == 2);
+            xSemaphoreGive(au_mutex);
+            if (ready)
+                break;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ESP_LOGI(TAG, "audio primed=%d", (int)(au_state[0] == 2));
+    }
 
     /* touch for pause/OSD; playback continues without it if init fails */
     if (bsp_touch_new(NULL, &s_tp) != ESP_OK) {
@@ -1246,14 +1452,6 @@ void app_main(void)
     ina_diag_init(); /* INA226 1Hz raw sampler; silent when 0x41 absent */
 
 
-    /* (Re)subscribe the main task early: pre-roll below feeds the WDT,
-     * and transfer mode deinitializes the watchdog. Startup does not
-     * guarantee subscription. */
-    {
-        esp_err_t wr = esp_task_wdt_add(NULL);
-        if (wr != ESP_OK && wr != ESP_ERR_INVALID_STATE)
-            ESP_ERROR_CHECK(wr);
-    }
     /* prefetch reader owns its own FILE handle; main loop consumes slots */
     pf_want = 0;
     pf_epoch = 1;
@@ -1421,7 +1619,8 @@ void app_main(void)
                      "prof shown=%u fps=%.1f "
                      "dec %u/%u/%u sd %u/%u/%u draw %u/%u/%u "
                      "wait %u/%u/%u aud %u/%u/%u "
-                     "low=%u skip=%u underrun=%lu",
+                     "low=%u skip=%u underrun=%lu "
+                     "aufeed %u/%u stalls=%u/%ums",
                      (unsigned)frames_shown, frames_shown / el,
                      (unsigned)d_a, (unsigned)d_p, (unsigned)d_m,
                      (unsigned)s_a, (unsigned)s_p, (unsigned)s_m,
@@ -1429,7 +1628,9 @@ void app_main(void)
                      (unsigned)w_a, (unsigned)w_p, (unsigned)w_m,
                      (unsigned)a_a, (unsigned)a_p, (unsigned)a_m,
                      (unsigned)low_water, (unsigned)frames_skip,
-                     (unsigned long)pf_underrun);
+                     (unsigned long)pf_underrun,
+                     (unsigned)au_feed_us, (unsigned)au_feed_max,
+                     (unsigned)au_stalls, (unsigned)au_stall_ms);
             /* Piggyback latest INA226 raw sample on its own line so the
              * existing prof line stays parser-compatible. */
             {
