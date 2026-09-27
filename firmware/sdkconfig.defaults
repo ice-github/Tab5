@@ -27,3 +27,9 @@ CONFIG_JPEG_ENABLE_DEBUG_LOG=n
 
 # app_main uses multi-KB transfer buffers
 CONFIG_MAIN_TASK_STACK_SIZE=16384
+
+# C: DFS は起動hangのため一旦無効化。再生中はDSI/DPI/I2Sの恒久ロックで
+# CPU 360MHz固定のまま効果がほぼゼロと判明。pause/SCREEN OFFの節電は
+# A/B/Dで確保する。将来再評価時に有効化する。
+# CONFIG_PM_ENABLE is not set
+# CONFIG_PM_DFS_INIT_AUTO is not set

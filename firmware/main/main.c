@@ -33,6 +33,8 @@
 #include <stdlib.h>
 #include "bsp/m5stack_tab5.h"
 #include "bsp/touch.h"
+#include "esp_pm.h"
+#include "ina_diag.h"
 /* Raw FatFs + DMA-capable alloc for the prefetch path */
 #include "esp_dma_utils.h"
 #include "ff.h"
@@ -271,6 +273,72 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 static uint16_t *s_pause_backup = NULL; /* PSRAM copy of paused frame */
 static void *s_displayed_fb = NULL;     /* fb last sent to the panel */
 
+/* ---- power saving state (A/B/D) ----
+ * s_codec_open=false means esp_codec_dev is closed and the speaker amp
+ * rail is off (BSP_FEATURE_SPEAKER). audio_task never calls write while
+ * closed; ui_touch_step owns suspend/resume from the main-loop context
+ * (I2C inside bsp_feature_enable is not ISR-safe).
+ * s_lcd_off=true means DISPOFF + backlight 0. DSI PHY/LDO stays on
+ * (no public API to drop it); resume re-sends the OSD framebuffer. */
+static volatile bool s_codec_open = true;
+static bool s_lcd_off = false;
+
+static void audio_suspend(void)
+{
+    if (!s_codec_open || spk == NULL)
+        return;
+    /* s_paused is already true: audio_task finishes its in-flight ~10ms
+     * write and then freezes. Wait it out so close() never races write(). */
+    vTaskDelay(pdMS_TO_TICKS(25));
+    esp_codec_dev_close(spk);
+    s_codec_open = false;
+    bsp_feature_enable(BSP_FEATURE_SPEAKER, false);
+    ESP_LOGI(TAG, "audio suspended (codec closed, amp off)");
+}
+
+static void audio_resume(void)
+{
+    if (s_codec_open || spk == NULL)
+        return;
+    bsp_feature_enable(BSP_FEATURE_SPEAKER, true);
+    vTaskDelay(pdMS_TO_TICKS(30)); /* amp rail settle + I2C flush */
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = A_RATE, .channel = A_CH, .bits_per_sample = 16};
+    if (esp_codec_dev_open(spk, &fs) != ESP_OK) {
+        ESP_LOGE(TAG, "audio resume: open failed");
+        return;
+    }
+    s_codec_open = true;
+    /* Re-apply the user volume; _update_codec_setting restores it too,
+     * but explicit is robust across sw_vol recreation. */
+    esp_codec_dev_set_out_vol(spk, s_vol);
+    ESP_LOGI(TAG, "audio resumed (vol %d)", s_vol);
+}
+
+static void display_off(void)
+{
+    if (s_lcd_off)
+        return;
+    if (s_panel != NULL)
+        esp_lcd_panel_disp_on_off(s_panel, false); /* DISPOFF, not deep sleep */
+    bsp_display_brightness_set(0);
+    /* Touch sleep is intentionally never used: on rev1 (GT911, INT=NC)
+     * enter_sleep succeeds but exit_sleep is a silent no-op, leaving touch
+     * stuck and the OFF-state wake tap dead. ST712x has no sleep support
+     * at all. Polling continues so any tap still wakes. */
+    s_lcd_off = true;
+}
+
+static void display_on(void)
+{
+    if (s_panel != NULL)
+        esp_lcd_panel_disp_on_off(s_panel, true); /* DISPON */
+    /* Never bsp_display_backlight_on(): it forces 100%, ignoring s_bri. */
+    bsp_display_brightness_set(s_bri);
+    /* No touch wake call: sleep is never entered (see display_off). */
+    s_lcd_off = false;
+}
+
 /* Minimal 5x7 font: rows are 5-bit values, bit4 = leftmost pixel.
  * Covers only what the OSD needs: space + - % 0-9 A B D E I L M O P R S U V T */
 typedef struct { char ch; uint8_t row[7]; } osd_glyph_t;
@@ -306,6 +374,7 @@ static const osd_glyph_t OSD_FONT[] = {
     {'T', {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}},
     {'U', {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}},
     {'V', {0x11,0x11,0x11,0x11,0x0A,0x0A,0x04}},
+    {'.', {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}},
 };
 static const uint8_t *osd_glyph(char c)
 {
@@ -377,6 +446,8 @@ static const osd_btn_t OSD_BTNS[BTN_N] = {
 #define OSD_LAB_BRI_X 840   /* center over the B button pair */
 #define OSD_HINT_Y    550
 #define OSD_HINT_SC   3
+#define OSD_BAT_Y     520
+#define OSD_BAT_SC    3
 
 static int osd_hit(int x, int y)
 {
@@ -440,6 +511,21 @@ static void osd_draw_all(void)
     const char *hint = "TAP OUTSIDE TO RESUME";
     ui_text(fb, (UI_W - osd_text_w(hint, OSD_HINT_SC)) / 2, OSD_HINT_Y,
             OSD_HINT_SC, hint, OSD_C_WHITE);
+    /* Battery status: voltage from INA226 bus rail, + while trickle
+     * charging (CHG_STAT low), - otherwise. Unknown -> dashes. */
+    {
+        char bat[20];
+        int32_t mv = ina_bus_mv();
+        int chg = power_charge_level();
+        if (mv < 0)
+            snprintf(bat, sizeof(bat), "BAT --.--V -");
+        else
+            snprintf(bat, sizeof(bat), "BAT %d.%02dV %c",
+                     (int)(mv / 1000), (int)((mv % 1000) / 10),
+                     (chg == 0) ? '+' : '-');
+        ui_text(fb, (UI_W - osd_text_w(bat, OSD_BAT_SC)) / 2, OSD_BAT_Y,
+                OSD_BAT_SC, bat, OSD_C_VAL);
+    }
 }
 
 static void osd_apply(int id)
@@ -448,9 +534,14 @@ static void osd_apply(int id)
         s_vol += (id == BTN_V_PLUS) ? OSD_VOL_STEP : -OSD_VOL_STEP;
         if (s_vol < 0) s_vol = 0;
         if (s_vol > 100) s_vol = 100;
-        if (esp_codec_dev_set_out_vol(spk, s_vol) != 0)
+        if (!s_codec_open) {
+            /* Paused with codec closed: defer HW apply to audio_resume(). */
+            ESP_LOGI(TAG, "osd volume %d (deferred, codec closed)", s_vol);
+        } else if (esp_codec_dev_set_out_vol(spk, s_vol) != 0) {
             ESP_LOGW(TAG, "set_out_vol %d failed", s_vol);
-        ESP_LOGI(TAG, "osd volume %d", s_vol);
+        } else {
+            ESP_LOGI(TAG, "osd volume %d", s_vol);
+        }
     } else if (id == BTN_B_MINUS || id == BTN_B_PLUS) {
         s_bri += (id == BTN_B_PLUS) ? OSD_BRI_STEP : -OSD_BRI_STEP;
         if (s_bri < OSD_BRI_MIN) s_bri = OSD_BRI_MIN;
@@ -516,18 +607,24 @@ static void ui_touch_step(bool can_pause)
         if (s_ui == UI_PLAY) {
             if (can_pause && s_displayed_fb != NULL) {
                 s_paused = true; /* audio_task freezes at chunk boundary */
+                audio_suspend(); /* A: codec close + amp off (video+audio cut) */
                 memcpy(s_pause_backup, s_displayed_fb, OSD_FB_SZ);
                 osd_draw_all();
                 osd_present();
                 s_ui = UI_OSD;
+                ina_diag_dump(); /* flush power history for post-reconnect read */
                 ESP_LOGI(TAG, "paused at sample %lu",
                          (unsigned long)audio_samples);
             }
         } else if (s_ui == UI_OSD) {
             if (hit == BTN_OFF) {
-                ESP_ERROR_CHECK(bsp_display_brightness_set(0));
+                /* B: DISPOFF + backlight 0 (+best-effort touch sleep).
+                 * Audio is already suspended from the PLAY->OSD transition;
+                 * re-assert in case the state was reached another way. */
+                audio_suspend();
+                display_off();
                 s_ui = UI_OFF;
-                ESP_LOGI(TAG, "screen off");
+                ESP_LOGI(TAG, "screen off (lcd+audio suspended)");
             } else if (hit == BTN_REPLACE) {
                 /* Drop the bundle flag and reboot into transfer mode so the
                  * host can send a new bundle. Old files are overwritten. */
@@ -541,13 +638,14 @@ static void ui_touch_step(bool can_pause)
                 /* outside buttons: hide OSD, resume from frozen position */
                 memcpy(s_displayed_fb, s_pause_backup, OSD_FB_SZ);
                 osd_present();
+                audio_resume(); /* amp on + codec open + vol re-apply */
                 s_paused = false;
                 s_ui = UI_PLAY;
                 ESP_LOGI(TAG, "resumed at sample %lu",
                          (unsigned long)audio_samples);
             }
         } else { /* UI_OFF: wake to OSD, stay paused */
-            ESP_ERROR_CHECK(bsp_display_brightness_set(s_bri));
+            display_on(); /* DISPON + s_bri restore + OSD FB resend */
             osd_draw_all();
             osd_present();
             s_ui = UI_OSD;
@@ -566,8 +664,9 @@ static void audio_task(void *arg)
      * An 8KB chunk blocks ~43ms per write and quantizes video to 23fps. */
     const size_t CHUNK = 1920; /* 480 stereo frames = 10.0ms @48kHz */
     while (1) {
-        if (s_paused) {
-            /* frozen: audio_pos/audio_samples untouched, video clock holds */
+        if (s_paused || !s_codec_open) {
+            /* frozen: audio_pos/audio_samples untouched, video clock holds.
+             * !s_codec_open covers the suspend window (close+amp off). */
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -578,6 +677,19 @@ static void audio_task(void *arg)
         size_t n = audio_len - audio_pos;
         if (n > CHUNK)
             n = CHUNK;
+        if (s_vol == 0) {
+            /* D: vol=0 is -50dB HW attenuation with DMA still running.
+             * Skip the I2S transaction and advance the video clock on the
+             * FreeRTOS tick instead. A/V sync holds because the clock is
+             * the only consumer; wall-clock rate error is acceptable for
+             * a muted stream. ES8388/PA rails stay up (see A for full
+             * suspend when paused). */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            a_write_us = 0;
+            audio_pos += n;
+            audio_samples += (uint32_t)(n / (A_CH * 2));
+            continue;
+        }
         int64_t a0 = esp_timer_get_time();
         esp_codec_dev_write(spk, audio_buf + audio_pos, n);
         a_write_us = (uint32_t)(esp_timer_get_time() - a0);
@@ -896,6 +1008,33 @@ static void prof_stats(prof_hist_t *h, uint32_t *avg, uint32_t *p95,
 
 void app_main(void)
 {
+    /* C: DFS first step (light sleep stays OFF). max=360 (rev<3上限),
+     * min from Kconfig (既定90). 再生中はDSI/DPI/I2Sの恒久ロックで
+     * CPUは360固定のままなので、効果は主にpause/SCREEN OFFで出る。
+     * TRANSFER中はUSB受信溢れ防止のため後段でNO_LIGHT_SLEEP相当の
+     * 扱いにする (現状light_sleep=falseなので実害なし、将来用)。 */
+#if CONFIG_PM_ENABLE
+    {
+        int min_mhz = 90;
+#ifdef CONFIG_TAB5_PM_MIN_40
+        min_mhz = 40;
+#elif defined(CONFIG_TAB5_PM_MIN_180)
+        min_mhz = 180;
+#endif
+        esp_pm_config_t pm_cfg = {
+            .max_freq_mhz = 360,
+            .min_freq_mhz = min_mhz,
+            .light_sleep_enable = false,
+        };
+        esp_err_t pmr = esp_pm_configure(&pm_cfg);
+        ESP_LOGI(TAG, "pm dfs max=360 min=%d rs=%s", min_mhz,
+                 esp_err_to_name(pmr));
+    }
+#endif
+    /* Enable battery charging (IP2326 via IO expander U7). Power-on
+     * default is OFF and the factory FW turns it on after init; without
+     * this the battery never charges. Covers transfer mode too. */
+    power_charge_enable();
     crc_init();
     ESP_LOGI(TAG, "tab5player build %s %s", __DATE__, __TIME__);
     esp_err_t sdr = bsp_sdcard_mount();
@@ -904,7 +1043,33 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }
-    ESP_ERROR_CHECK(bsp_display_brightness_init());
+#ifdef CONFIG_TAB5_SD_FREQ_LOW
+    /* E: power-test remount at 20MHz (default Kconfig is 40MHz HIGHSPEED).
+     * Compare sd_us avg/p95/max + pf_underrun + skip before adopting. */
+    {
+        bsp_sdcard_unmount();
+        sdmmc_host_t host;
+        bsp_sdcard_get_sdmmc_host(SDMMC_HOST_SLOT_1, &host);
+        host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+        sdmmc_slot_config_t slot;
+        bsp_sdcard_sdmmc_get_slot(SDMMC_HOST_SLOT_1, &slot);
+        bsp_sdcard_cfg_t cfg = {
+            .host = &host,
+            .slot = &slot,
+        };
+        sdr = bsp_sdcard_sdmmc_mount(&cfg);
+        ESP_LOGI(TAG, "sd remount 20MHz rs=%s", esp_err_to_name(sdr));
+        if (sdr != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+        }
+    }
+#else
+    ESP_LOGI(TAG, "sd HIGHSPEED 40MHz");
+#endif
+    /* No bsp_display_brightness_init() here: bsp_display_new() below
+     * self-initializes it (BSP docs). The early call only re-ran the same
+     * LEDC setup on GPIO22. */
 
     struct stat st;
     bool have_bundle = (stat(FLAG_FILE, &st) == 0);
@@ -1078,8 +1243,17 @@ void app_main(void)
         ESP_LOGW(TAG, "touch init failed, running without OSD");
         s_tp = NULL;
     }
+    ina_diag_init(); /* INA226 1Hz raw sampler; silent when 0x41 absent */
 
 
+    /* (Re)subscribe the main task early: pre-roll below feeds the WDT,
+     * and transfer mode deinitializes the watchdog. Startup does not
+     * guarantee subscription. */
+    {
+        esp_err_t wr = esp_task_wdt_add(NULL);
+        if (wr != ESP_OK && wr != ESP_ERR_INVALID_STATE)
+            ESP_ERROR_CHECK(wr);
+    }
     /* prefetch reader owns its own FILE handle; main loop consumes slots */
     pf_want = 0;
     pf_epoch = 1;
@@ -1110,13 +1284,6 @@ void app_main(void)
                 h_aud = {0};
     uint32_t low_water = UINT32_MAX;
     int cur = 0;
-    /* (Re)subscribe the main task: startup does not guarantee subscription,
-     * and transfer mode deinitializes the watchdog. */
-    {
-        esp_err_t wr = esp_task_wdt_add(NULL);
-        if (wr != ESP_OK && wr != ESP_ERR_INVALID_STATE)
-            ESP_ERROR_CHECK(wr);
-    }
     while (1) {
         esp_task_wdt_reset();
         /* non-blocking touch step first; while paused it also owns the delay */
@@ -1263,6 +1430,22 @@ void app_main(void)
                      (unsigned)a_a, (unsigned)a_p, (unsigned)a_m,
                      (unsigned)low_water, (unsigned)frames_skip,
                      (unsigned long)pf_underrun);
+            /* Piggyback latest INA226 raw sample on its own line so the
+             * existing prof line stays parser-compatible. */
+            {
+                ina_sample_t ina_latest;
+                if (ina_diag_latest(&ina_latest))
+                    ESP_LOGI(TAG, "ina t=%lld bus=%u shunt=%u cal=%u err=%s",
+                             (long long)ina_latest.t_us, ina_latest.bus_raw,
+                             ina_latest.shunt_raw, ina_latest.cal_raw,
+                             esp_err_to_name(ina_latest.err));
+            }
+            /* Battery status about every 10s (every 5th prof line). */
+            if ((frames_shown & 319) == 0) {
+                int32_t mv = ina_bus_mv();
+                int chg = power_charge_level();
+                ESP_LOGI(TAG, "batt %ldmV chg_stat=%d", (long)mv, chg);
+            }
             low_water = UINT32_MAX;
         }
     }

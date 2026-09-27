@@ -1,0 +1,45 @@
+menu "Tab5 player power options"
+
+    choice TAB5_PM_MIN_FREQ
+        prompt "DFS minimum CPU frequency while idle"
+        default TAB5_PM_MIN_90
+        help
+            Applied via esp_pm_configure() at startup (max stays 360MHz,
+            light sleep stays OFF in the first step). While video is
+            playing the MIPI-DSI/DPI/I2S drivers hold PM locks, so the
+            saving shows mainly in pause/SCREEN OFF. Measure before
+            changing.
+
+        config TAB5_PM_MIN_90
+            bool "90 MHz (recommended first step)"
+        config TAB5_PM_MIN_40
+            bool "40 MHz (XTAL, max saving, max wake latency)"
+        config TAB5_PM_MIN_180
+            bool "180 MHz (minimal variation)"
+    endchoice
+
+    choice TAB5_SD_FREQ
+        prompt "SDMMC clock for power comparison"
+        default TAB5_SD_FREQ_HIGH
+        help
+            HIGHSPEED (40MHz) is the current production setting.
+            20MHz halves the theoretical bus bandwidth to compare SD
+            power vs prefetch underrun (PF_WAIT_MS) and fps. Measure
+            sd_us avg/p95/max + pf_underrun + skip before adopting.
+
+        config TAB5_SD_FREQ_HIGH
+            bool "40 MHz HIGHSPEED (default)"
+        config TAB5_SD_FREQ_LOW
+            bool "20 MHz (power-test only)"
+    endchoice
+
+    config TAB5_INA_DIAG_ENABLE
+        bool "INA226 diagnostic sampling (1Hz raw log)"
+        default y
+        help
+            Sample INA226 at I2C 0x41 once per second and keep raw
+            bus/shunt values in RAM for later dump. No power
+            conversion: shunt value is unconfirmed. Auto-disables
+            when 0x41 does not answer.
+
+endmenu
