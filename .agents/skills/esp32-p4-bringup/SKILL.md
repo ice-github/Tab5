@@ -12,12 +12,18 @@ observing the failure before editing.
 
 - Read the actual silicon revision: `esptool.py --port <PORT> chip_id`.
   Early Tab5 units report ESP32-P4 **revision v1.0**.
-- Newer ESP-IDF bootloaders can refuse old silicon, e.g. IDF v5.5:
+- ESP-IDF bootloaders can refuse old silicon when the revision range is
+  left at default, e.g. IDF v5.5 default:
   `bootloader.bin requires chip revision in range [v3.1 - v3.99]`.
-- Fix: build with an IDF release whose bootloader supports the observed
-  revision (v1.0 silicon works with `release/v5.4`). Never `--force` a
-  mismatched bootloader onto old silicon.
-- Gate: `flash` must succeed without `--force`.
+- Fix: set the revision range explicitly for the observed silicon. v5.5.x
+  still supports old silicon via Kconfig (verified on v5.5.4 + rev v1.0):
+  `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` + `CONFIG_ESP32P4_REV_MIN_100=y`
+  (range v1.0-v1.99; old/new-rev support is mutually exclusive, so pick
+  by the actual chip, never both). No need to downgrade to v5.4 for
+  revision reasons alone. Never `--force` a mismatched bootloader onto
+  old silicon.
+- Gate: `flash` must succeed without `--force`, and the generated
+  `sdkconfig` must show the intended `ESP_REV_MIN/MAX_FULL`.
 
 ## 2. Panic triage (decode before fixing)
 

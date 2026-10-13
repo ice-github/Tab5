@@ -3,11 +3,21 @@ name: tab5-media-bundle
 description: Use when preparing a portrait video bundle for the Tab5 player: downloading a YouTube clip, cutting the first 10 seconds, rotating to 720x1280 JPEG frames, building frames.mjpeg + frames.idx, resampling audio to 48kHz stereo PCM, and verifying the bundle. Trigger when the user wants a new clip on the device or the player reports frame/audio mismatch.
 ---
 
-# Tab5 Portrait Media Bundle (10s, 720x1280 JPEG + PCM)
+# Tab5 Portrait Media Bundle (720x1280 JPEG + PCM)
 
 Output is `media/bundle/` (git-ignored, regenerable): `meta.json`,
 `frames.mjpeg`, `frames.idx`, `audio.pcm`. Keep `media/` out of git;
 only the recipe and verification live in the repo.
+
+Two bundle generations exist in this project; do not mix their layouts:
+
+- **10s check bundle** (this skill): 300 frames / 30fps, `frames.mjpeg`
+  ~7MB, `audio.pcm` ~1.92MB. Use for transfer-path verification.
+- **3min playback bundle** (`tools/assemble180.py` + `tools/verify180.py`,
+  `media.bundle180/q{q}/`): 5400 frames / 30fps, `frames.mjpeg` ~493MB,
+  `audio.pcm` 34.56MB streamed from SD (never fully in PSRAM). The player
+  trusts `meta.json` + index chaining the same way; verify with
+  `verify180.py`, not the checks below.
 
 ## 1. Source acquisition
 
@@ -72,3 +82,11 @@ only the recipe and verification live in the repo.
 - Never commit `media/` output; never transfer an unverified bundle.
   A bundle that fails check 2 or 3 will fail on-device CRC or playback
   — fix it on the PC, not on the device.
+- Transfer path (after verification): stop the monitor (it holds the
+  port), put the device in transfer mode (fresh boot without
+  `/sdcard/video/complete`, or OSD `REPLACE` — which deletes existing
+  content, so confirm first), then
+  `python tools/send_bundle.py <PORT> <bundle-dir>`. Success is per-file
+  `OK <CRC>` plus final `COMPLETE`. See `tab5-linux-build-deploy` for
+  the Linux environment and `esp32-p4-bringup` for transfer failure
+  triage.
