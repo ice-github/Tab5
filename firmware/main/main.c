@@ -20,6 +20,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/jpeg_decode.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_lcd_panel_ops.h"
@@ -49,6 +51,8 @@ static const char *TAG = "tab5player";
 #define A_RATE       48000
 #define A_CH         2
 #define CRC_POLY     0xEDB88320u
+#define TAB5_BL_PWM_FIX 1
+#define TAB5_BL_PWM_HZ 20000
 
 static uint32_t crc32_tab[256];
 static void crc_init(void)
@@ -264,11 +268,11 @@ static volatile uint32_t au_stall_ms; /* consumer buffer-wait time, ms (cumul) *
  * so A/V sync — including loop-boundary cases — is automatic.
  *
  * Touch UI is landscape 1280x720, locked to the video content orientation.
- * Video frames are pre-rotated with transpose=1 (90deg CW): landscape (lx,ly)
- * -> portrait fb (719-ly, lx). The OSD uses the same transform so text reads
- * upright when the scene is upright: UI (ux,uy) -> fb (719-uy, ux), and raw
- * touch (rx,ry) -> UI (ry, 719-rx). touch_to_ui() is the single compensation
- * point; every press logs raw + UI coords + hit result for on-device check.
+ * Video frames are losslessly pre-rotated 180 degrees on the host. The
+ * existing portrait-to-landscape display transform then maps UI (ux,uy) to
+ * fb (uy, 1279-ux), rotating video and OSD together without panel mirroring
+ * or per-frame software rotation. Raw touch (rx,ry) maps to UI (1279-ry,rx);
+ * touch_to_ui() is the single compensation point and logs each press.
  *
  * Actions fire on the press edge (no press/release same-button requirement):
  * one tap = one action, immune to release-coordinate jitter. Tapping outside
@@ -417,7 +421,7 @@ static void ui_fill(uint16_t *fb, int x0, int y0, int x1, int y1, uint16_t c)
     if (y1 > UI_H) y1 = UI_H;
     for (int uy = y0; uy < y1; uy++)
         for (int ux = x0; ux < x1; ux++)
-            fb[(size_t)ux * FB_W + (FB_W - 1 - uy)] = c;
+            fb[(size_t)(FB_H - 1 - ux) * FB_W + uy] = c;
 }
 static void ui_char(uint16_t *fb, int x, int y, int sc, char c, uint16_t col)
 {
@@ -576,11 +580,10 @@ static void osd_apply(int id)
 
 /* Single compensation point for touch orientation. Assumes the controller
  * reports portrait fb pixels (BSP defaults: x_max=720, y_max=1280, no
- * swap/mirror); converts to UI landscape coords with the video transform.
- * Adjust here if the on-device orientation check shows otherwise. */
+ * swap/mirror); inverse of the pre-rotated video's UI-to-framebuffer mapping. */
 static void touch_to_ui(uint16_t rx, uint16_t ry, int *ox, int *oy)
 {
-    int ux = (int)ry, uy = (FB_W - 1) - (int)rx;
+    int ux = (FB_H - 1) - (int)ry, uy = (int)rx;
     if (ux < 0) ux = 0;
     if (ux >= UI_W) ux = UI_W - 1;
     if (uy < 0) uy = 0;
@@ -1335,6 +1338,35 @@ void app_main(void)
     void *fb0, *fb1;
     ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(panel, 2, &fb0, &fb1));
     ESP_LOGI(TAG, "fb0=%p fb1=%p", fb0, fb1);
+#if TAB5_BL_PWM_FIX
+    /* Flicker fix: video load + 5kHz backlight PWM caused edge flicker
+     * (video+DC confirmed clean). Re-run the same 10-bit LEDC setup at
+     * 20kHz so brightness control keeps working above the visible beat
+     * range. BSP owns the default 5kHz init; override it here. */
+    ESP_ERROR_CHECK(bsp_display_brightness_deinit());
+    {
+        const ledc_timer_config_t t = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .duty_resolution = LEDC_TIMER_10_BIT,
+            .timer_num = LEDC_TIMER_0,
+            .freq_hz = TAB5_BL_PWM_HZ,
+            .clk_cfg = LEDC_AUTO_CLK,
+        };
+        ESP_ERROR_CHECK(ledc_timer_config(&t));
+        const ledc_channel_config_t c = {
+            .gpio_num = GPIO_NUM_22,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = CONFIG_BSP_DISPLAY_BRIGHTNESS_LEDC_CH,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = LEDC_TIMER_0,
+            .duty = 0,
+            .hpoint = 0,
+        };
+        ESP_ERROR_CHECK(ledc_channel_config(&c));
+    }
+    ESP_ERROR_CHECK(bsp_display_brightness_set(s_bri));
+    ESP_LOGW(TAG, "backlight PWM fix active: %dHz 10-bit", TAB5_BL_PWM_HZ);
+#endif
 
 
     /* jpeg decoder */
